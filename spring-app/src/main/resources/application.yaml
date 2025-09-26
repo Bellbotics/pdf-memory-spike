@@ -1,0 +1,8 @@
+server:
+  port: 8033
+
+triage:
+  base-url: http://127.0.0.1:8000
+
+memSpike:
+  thresholdMb: 3500
