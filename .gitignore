@@ -1,8 +1,24 @@
-target/
-*.iml
-*.class
+# 🔒 Ignore all retrained model artifacts
+sidecar/models/pipeline.pkl
+sidecar/models/metrics.json
+
+# 🧪 Allow committing versioned baselines (v1, v2, etc.)
+!sidecar/models/pipeline_v*.pkl
+!sidecar/models/metrics_v*.json
+
+# 🔒 Ignore large files or experiment dumps
+*.onnx
+*.joblib
+*.pkl
+
+# 🧪 Allow keeping a small synthetic sample dataset
+!training/sample_data.csv
+
+# 🗑 OS / Editor noise
+.DS_Store
+*.swp
+*.swo
 .idea/
 .vscode/
 __pycache__/
-*.pyc
-.DS_Store
+.venv/
