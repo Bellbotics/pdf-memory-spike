@@ -27,6 +27,11 @@ spec:
               value: http://127.0.0.1:8000
             - name: MEMSPIKE_THRESHOLD_MB
               value: "3500"
+            - name: DATADOG_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datadog-keys
+                  key: DD_API_KEY
           readinessProbe:
             httpGet: { path: /actuator/health, port: http }
             initialDelaySeconds: 5

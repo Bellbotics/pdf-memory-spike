@@ -6,3 +6,18 @@ triage:
 
 memSpike:
   thresholdMb: 3500
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  datadog:
+    metrics:
+      export:
+        enabled: true
+        api-key: ${DATADOG_API_KEY:}
+        step: 30s
+        application-key: ${DATADOG_APP_KEY:}
+        host-tag: instance
+        uri: https://api.datadoghq.com

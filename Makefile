@@ -63,3 +63,17 @@ clean:
 	- kind delete cluster --name $(KIND_CLUSTER)
 	- docker stop $(REGISTRY_NAME) && docker rm $(REGISTRY_NAME)
 	@echo "✅ Cleaned."
+
+.PHONY: train
+train:
+	@echo "🎓 Training model → sidecar/models/"
+	. .venv/bin/activate && python training/memory_spike_train.py --out-dir sidecar/models --seed 42
+
+.PHONY: compose
+compose:
+	docker compose up --build
+
+.PHONY: dataset
+dataset:
+	chmod +x tools/*.sh || true
+	./tools/build_dataset.sh ./samples training/sample_data_real.csv

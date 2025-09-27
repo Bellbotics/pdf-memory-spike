@@ -2,12 +2,17 @@ package com.example.bds;
 
 import com.example.bds.dto.PdfFeatures;
 import com.example.bds.dto.RouteDecision;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Service responsible for interacting with the Memory Spike Predictor
@@ -56,40 +61,19 @@ import java.util.Map;
 public class MemorySpikeService {
     private final WebClient client;
     private final double thresholdMb;
+    private final MeterRegistry meter;
 
-    /**
-     * Constructs a new {@code MemorySpikeService}.
-     *
-     * @param memoryScoreWebClient the {@link WebClient} configured to
-     *                             call the predictor sidecar service
-     * @param thresholdMb          the memory threshold in megabytes used
-     *                             to decide between {@code STANDARD_PATH}
-     *                             and {@code ROUTE_BIG_MEMORY}
-     */
-    public MemorySpikeService(WebClient memoryScoreWebClient,
-                              @Value("${memSpike.thresholdMb:3500}") double thresholdMb) {
-        this.client = memoryScoreWebClient;
+    public MemorySpikeService(WebClient memScoreWebClient,
+                              @Value("${memSpike.thresholdMb:3500}") double thresholdMb,
+                              MeterRegistry meterRegistry) {
+        this.client = memScoreWebClient;
         this.thresholdMb = thresholdMb;
+        this.meter = meterRegistry;
     }
 
-    /**
-     * Submits the given {@link PdfFeatures} to the Memory Spike Predictor
-     * service and returns a reactive {@link Mono} containing a
-     * {@link RouteDecision}.
-     *
-     * <p>
-     * The method wraps the features and threshold into a JSON body, performs
-     * a POST request to {@code /predict}, and maps the response into
-     * a {@link RouteDecision}. If the request fails, a fallback decision
-     * {@code ROUTE_BIG_MEMORY} is returned with a prediction of -1 MB.
-     * </p>
-     *
-     * @param f the {@link PdfFeatures} describing the PDF to be analyzed
-     * @return a {@link Mono} that emits the routing decision and predicted
-     *         peak memory usage
-     */
     public Mono<RouteDecision> decide(PdfFeatures f) {
         var body = Map.of("features", f, "big_mem_threshold_mb", thresholdMb);
+        long t0 = System.nanoTime();
         return client.post().uri("/predict")
                 .bodyValue(body)
                 .retrieve()
@@ -97,6 +81,21 @@ public class MemorySpikeService {
                 .map(resp -> new RouteDecision(
                         (String) resp.getOrDefault("decision", "ROUTE_BIG_MEMORY"),
                         ((Number) resp.getOrDefault("predicted_peak_mb", -1)).doubleValue()))
-                .onErrorResume(ex -> Mono.just(new RouteDecision("ROUTE_BIG_MEMORY", -1)));
+                .doOnNext(dec -> {
+                    long ms = (System.nanoTime() - t0) / 1_000_000;
+                    Timer.builder("memspike.predict.latency")
+                            .tag("decision", dec.decision())
+                            .register(meter).record(ms, TimeUnit.MILLISECONDS);
+                    DistributionSummary.builder("memspike.predicted.peak_mb")
+                            .baseUnit("megabytes")
+                            .register(meter).record(dec.predicted_peak_mb());
+                    Counter.builder("memspike.decision.count")
+                            .tag("decision", dec.decision())
+                            .register(meter).increment();
+                })
+                .onErrorResume(ex -> {
+                    Counter.builder("memspike.predict.errors").register(meter).increment();
+                    return Mono.just(new RouteDecision("ROUTE_BIG_MEMORY", -1));
+                });
     }
 }

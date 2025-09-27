@@ -3,11 +3,14 @@ package com.example.bds;
 
 import com.example.bds.dto.PdfFeatures;
 import com.example.bds.dto.RouteDecision;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
+
+import java.util.Map;
 
 /**
  * REST controller that exposes endpoints for PDF intake routing.
@@ -61,6 +64,7 @@ import reactor.core.publisher.Mono;
  */
 @RestController
 @RequestMapping("/v1/intake")
+@Slf4j
 public class IntakeController {
     private final MemorySpikeService service;
 
@@ -88,6 +92,22 @@ public class IntakeController {
      */
     @PostMapping("/route")
     public Mono<RouteDecision> route(@RequestBody PdfFeatures features) {
-        return service.decide(features);
+        long t0 = System.nanoTime();
+        return service.decide(features)
+                .doOnNext(dec -> {
+                    long ms = (System.nanoTime() - t0) / 1_000_000;
+                    log.info("memSpike decision",
+                            kv("decision", dec.decision()),
+                            kv("predicted_peak_mb", dec.predicted_peak_mb()),
+                            kv("latency_ms", ms),
+                            kv("pages", features.pages()),
+                            kv("size_mb", features.size_mb()),
+                            kv("producer", features.producer()));
+                });
+    }
+
+    // tiny helper for kv logging
+    private Map<String,Object> kv(String k, Object v) {
+        return Map.of(k, v);
     }
 }

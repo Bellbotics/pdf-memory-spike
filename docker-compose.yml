@@ -1,0 +1,10 @@
+services:
+  mem-spike-scorer:
+    build:
+      context: ./sidecar
+      dockerfile: Dockerfile.sidecar
+    image: mem-spike-scorer:dev
+    ports:
+      - "8000:8000"
+    environment:
+      - PIPELINE_PATH=/models/pipeline.pkl

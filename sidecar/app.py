@@ -1,36 +1,26 @@
-"""
-FastAPI sidecar service for Memory Spike Predictor.
-
-This service loads a pre-trained scikit-learn Pipeline (pipeline.pkl) and
-exposes a REST API to score PDF feature sets. The model predicts the
-peak memory usage (in MB) of processing a given PDF and returns a
-routing decision based on a configurable threshold.
-
-Endpoints:
-  - GET  /healthz   → health check
-  - POST /predict   → run inference and return predicted MB + decision
-"""
+# sidecar/app.py
 from __future__ import annotations
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
-import pickle
-import pandas as pd
+import os, pickle, pandas as pd
+from pathlib import Path
 
-# -------------------------------------------------------------------
-# Constants and model loading
-# -------------------------------------------------------------------
+# Prefer an env var; otherwise default to the repo-local model path
+DEFAULT_LOCAL_MODEL = Path(__file__).parent / "models" / "pipeline.pkl"
+PIPELINE_PATH = os.getenv("PIPELINE_PATH", str(DEFAULT_LOCAL_MODEL))
 
-# Path inside the container where the trained pipeline.pkl is mounted.
-PIPELINE_PATH = "/models/pipeline.pkl"
+def _load_pipe(path: str):
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"Model not found at '{path}'. "
+            "Train to sidecar/models/ or set PIPELINE_PATH to an absolute file path."
+        ) from e
 
-# Load the trained scikit-learn Pipeline into memory at startup.
-# This keeps inference fast because the model is only unpickled once.
-pipe = pickle.load(open(PIPELINE_PATH, "rb"))
-
-# Default threshold (MB) for routing.
-# If predicted peak >= threshold → "ROUTE_BIG_MEMORY"
-# else → "STANDARD_PATH".
+pipe = _load_pipe(PIPELINE_PATH)
 DEFAULT_THRESHOLD_MB = 3500.0
 
 

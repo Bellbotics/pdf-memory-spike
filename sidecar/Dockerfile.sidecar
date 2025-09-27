@@ -1,8 +1,17 @@
-# Dockerfile.sidecar
-FROM python:3.11-slim
+FROM python:3.13-slim
 WORKDIR /app
+
+# system libs (scikit-learn wheels should avoid compile; libgomp is safe)
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
+
+# model goes under /models inside image
 COPY models/pipeline.pkl /models/pipeline.pkl
 COPY app.py /app/app.py
-RUN pip install --no-cache-dir fastapi uvicorn scikit-learn==1.4.2 pandas==2.2.2 pydantic==2.8.2
+
+ENV PIPELINE_PATH=/models/pipeline.pkl
 EXPOSE 8000
-CMD ["uvicorn","app:app","--host","127.0.0.1","--port","8000","--workers","1"]
+CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8000","--workers","1"]
