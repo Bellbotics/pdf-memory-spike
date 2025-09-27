@@ -1,0 +1,16 @@
+# k8s/service.yaml
+# Purpose: Stable network endpoint for clients inside the cluster.
+# For local dev, use `kubectl port-forward` to reach it from your Mac.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: bds
+  namespace: pdf-ml
+spec:
+  selector: { app: bds }   # routes traffic to Pods with this label
+  ports:
+    - name: http
+      port: 8033           # cluster-internal Service port
+      targetPort: http     # matches 'name: http' in containerPort of Deployment
+  # type: ClusterIP is default (best for local dev + port-forwarding)

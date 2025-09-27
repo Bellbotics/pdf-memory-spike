@@ -1,0 +1,42 @@
+# skaffold.yaml
+# Purpose: Automate the local dev loop for the pdf-memory-spike project.
+# Skaffold handles building Docker images, pushing them to the local registry,
+# and applying Kubernetes manifests, all with file-watching for rapid iteration.
+#
+# Usage:
+#   skaffold dev      # watch source, rebuild images, redeploy on change
+#   skaffold run      # one-off build + deploy
+#   skaffold delete   # remove deployed resources
+
+apiVersion: skaffold/v4beta10
+kind: Config
+metadata:
+  # Logical name for this skaffold config (shows up in logs/CLI)
+  name: pdf-memory-spike
+
+build:
+  # Use local Docker daemon for builds
+  local:
+    push: true   # push to registry after build (needed since cluster runs in kind)
+  artifacts:
+    # --- Artifact 1: Spring Boot app (Java) ---
+    - image: localhost:5001/bds-app          # final image tag pushed to local registry
+      context: spring-app                    # source dir for build context
+      docker:
+        dockerfile: Dockerfile.spring        # build instructions
+    # --- Artifact 2: FastAPI sidecar (Python) ---
+    - image: localhost:5001/mem-spike-scorer
+      context: sidecar
+      docker:
+        dockerfile: Dockerfile.sidecar
+
+manifests:
+  # Apply raw Kubernetes manifests directly.
+  # Here we’re pointing only to deployment.yaml (which also defines the sidecar).
+  # You could include service.yaml as well if you want Skaffold to manage both.
+  rawYaml:
+    - k8s/deployment.yaml
+
+deploy:
+  # Use kubectl to apply manifests. Skaffold will re-apply on changes.
+  kubectl: {}

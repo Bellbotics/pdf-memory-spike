@@ -1,0 +1,49 @@
+# k8s/deployment.yaml
+# Purpose: Defines how to run the application (Pod template + replicas).
+# Use when you prefer split manifests (svc/deploy separate) or in CI pipelines.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bds
+  namespace: pdf-ml
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bds }
+  template:
+    metadata:
+      labels: { app: bds }
+    spec:
+      containers:
+        - name: bds-app
+          image: localhost:5001/bds-app:dev
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8033
+              name: http
+          env:
+            - name: TRIAGE_BASE_URL
+              value: http://127.0.0.1:8000
+            - name: MEMSPIKE_THRESHOLD_MB
+              value: "3500"
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { cpu: "500m", memory: "1Gi" }
+        - name: mem-spike-scorer
+          image: localhost:5001/mem-spike-scorer:dev
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: memscore
+          readinessProbe:
+            httpGet: { path: /healthz, port: memscore }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "250m", memory: "256Mi" }

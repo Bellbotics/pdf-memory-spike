@@ -1,0 +1,8 @@
+# Dockerfile.sidecar
+FROM python:3.11-slim
+WORKDIR /app
+COPY pipeline.pkl /models/pipeline.pkl
+COPY app.py /app/app.py
+RUN pip install --no-cache-dir fastapi uvicorn scikit-learn==1.4.2 pandas==2.2.2 pydantic==2.8.2
+EXPOSE 8000
+CMD ["uvicorn","app:app","--host","127.0.0.1","--port","8000","--workers","1"]

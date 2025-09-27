@@ -1,0 +1,21 @@
+# kind/kind-config.yaml
+# Purpose: Bootstrap a local kind cluster that trusts a local Docker registry
+# (so image builds/pushes stay on your machine and are super fast).
+#
+# Create the registry (one-time):
+#   docker run -d -p 5001:5000 --name kind-registry --restart=always registry:2
+#
+# Create the cluster using this config:
+#   kind create cluster --name pdf-ml --config kind/kind-config.yaml
+#
+# After cluster creation, connect the registry container to kind network:
+#   docker network connect "kind" "kind-registry" 2>/dev/null || true
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://kind-registry:5000"]
+nodes:
+  - role: control-plane   # one control-plane node is enough for dev
