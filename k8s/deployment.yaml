@@ -1,72 +1,200 @@
 # k8s/deployment.yaml
-# Purpose: Defines how to run the application (Pod template  replicas).
-# Use when you prefer split manifests (svc/deploy separate) or in CI pipelines.
+# Purpose: Defines how to run the application Pod(s) and their sidecar(s).
+# Typical usage: keep Deployment and Service as separate manifests (helps CI/CD and rollouts).
+# NOTE: This manifest runs TWO containers in ONE Pod (Spring app + FastAPI sidecar).
+#       The Spring app calls the sidecar via 127.0.0.1 (localhost) inside the Pod.
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bds
-  namespace: pdf-ml
+  name: bds                         # Name of the Deployment (stable identifier for rollout history)
+  namespace: pdf-ml                 # Namespace must exist (kubectl create ns pdf-ml) or be created separately
 spec:
-  replicas: 1
+  replicas: 1                       # Scale out here; consider HPA for CPU/memory-based autoscaling
+  # Optional: control rollout strategy (defaults to RollingUpdate)
+  # strategy:
+  #   type: RollingUpdate
+  #   rollingUpdate:
+  #     maxUnavailable: 0
+  #     maxSurge: 1
+
+  # The Deployment’s selector MUST match the pod template’s labels below.
   selector:
     matchLabels: { app: bds }
+
   template:
     metadata:
-      labels: { app: bds }
+      labels: { app: bds }          # Label used by the selector above and by the Service to pick Pods
+      # Optional: extra labels for observability/rbac selection
+      # annotations:
+      #   prometheus.io/scrape: "true"
+      #   prometheus.io/port: "8033"
+      #   prometheus.io/path: "/actuator/prometheus"
+
     spec:
+      # Optional: run pods with a dedicated service account (least privilege)
+      # serviceAccountName: bds-sa
+
+      # Optional: set a pod-level security posture (tighten further per container)
+      # securityContext:
+      #   runAsNonRoot: true
+      #   fsGroup: 2000
+
+      # Optional: tune termination timing so Spring can flush and sidecar can finish requests
+      # terminationGracePeriodSeconds: 30
+
+      # Optional: keep local training artifacts across restarts (emptyDir) or use a PVC for persistence.
+      # volumes:
+      #   - name: data-dir
+      #     emptyDir: {}              # ephemeral; use a PVC for durable storage
+      #   - name: models-dir
+      #     emptyDir: {}
+      #   - name: config
+      #     configMap:
+      #       name: bds-config       # place app config in a ConfigMap and mount or envFrom it
+
       containers:
+        # =========================
+        # 1) Spring WebFlux service
+        # =========================
         - name: bds-app
-          image: localhost:5001/bds-app:dev
-          imagePullPolicy: Always
+          image: localhost:5001/bds-app:dev  # Image in your local registry (e.g., kind registry on :5001)
+          imagePullPolicy: Always            # Always pull latest tag (use IfNotPresent for immutable tags)
           ports:
-            - containerPort: 8033
+            - containerPort: 8033            # Spring server.port
               name: http
+
+          # Environment variables → Spring Boot properties (relaxed binding applies).
+          # TRIAGE_BASE_URL maps to triage.base-url (Spring converts _ to . and lowers case).
           env:
             - name: TRIAGE_BASE_URL
+              # IMPORTANT: We’re using the in-pod sidecar (localhost) so the app can reach it even without a Service.
+              # If you split the sidecar to a separate Deployment, change this to the sidecar Service DNS (e.g., http://mem-spike-scorer:8000).
               value: http://127.0.0.1:8000
-            - name: MEMSPIKE_THRESHOLD_MB
+
+            # Threshold for "big memory" routing.
+            # NOTE: Your Spring property is bds.route-threshold-mb. The correct env var for Spring would be BDS_ROUTE_THRESHOLD_MB.
+            # If you keep MEMSPIKE_THRESHOLD_MB, ensure your code reads that key explicitly (e.g., @Value("${MEMSPIKE_THRESHOLD_MB:3500}")).
+            - name: BDS_ROUTE_THRESHOLD_MB
               value: "3500"
+
+            # Keep management endpoints on the same port as the app (default). Set a different port if desired.
+            # Ex: MANAGEMENT_SERVER_PORT=9000 → /actuator/* served on 9000. Here we leave it same as app port for simplicity.
             - name: MANAGEMENT_SERVER_PORT
               value: "8033"
+
+            # Datadog API key from a Secret. If not using Datadog in-cluster, remove this and disable the exporter.
             - name: DATADOG_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: datadog-keys
+                  name: datadog-keys      # kubectl create secret generic datadog-keys --from-literal=DD_API_KEY=xxxxx -n pdf-ml
                   key: DD_API_KEY
+
+            # Optional: explicitly disable Datadog exporter in non-prod clusters
+            # - name: MANAGEMENT_METRICS_EXPORT_DATADOG_ENABLED
+            #   value: "false"
+
+          # If you mounted volumes above, attach here:
+          # volumeMounts:
+          #   - name: data-dir
+          #     mountPath: /workspace/data         # ensure app paths (bds.data-dir / train-csv / model-file) point here
+          #   - name: config
+          #     mountPath: /config                 # if you mount YAML/props, also set SPRING_CONFIG_ADDITIONAL_LOCATION=/config/
+
+          # health probes — make sure these endpoints are exposed:
+          # In Spring Boot 3, liveness/readiness are available iff management.endpoint.health.probes.enabled=true (set in application*.yaml).
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # Security hardening — consider enabling (some frameworks want extra perms; test first)
+          # securityContext:
+          #   runAsNonRoot: true
+          #   allowPrivilegeEscalation: false
+          #   readOnlyRootFilesystem: true
+          #   capabilities:
+          #     drop: ["ALL"]
+
+          # Requests/limits: right-size based on telemetry (bds.route.decision, heap peaks).
           resources:
             requests: { cpu: "200m", memory: "512Mi" }
             limits:   { cpu: "500m", memory: "1Gi" }
+
+        # ================================
+        # 2) FastAPI sidecar (mem scorer)
+        # ================================
         - name: mem-spike-scorer
           image: localhost:5001/mem-spike-scorer:dev
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
               name: memscore
+
+          # If the sidecar loads a model on startup, allow a few seconds before probing
           livenessProbe:
             httpGet:
-              path: /health
+              path: /health               # Sidecar exposes /health (200 OK JSON)
               port: memscore
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
           readinessProbe:
             httpGet:
               path: /health
               port: memscore
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # If you want the sidecar to load models from a shared volume, mount it:
+          # volumeMounts:
+          #   - name: models-dir
+          #     mountPath: /app/models
+
+          # Security posture
+          # securityContext:
+          #   runAsNonRoot: true
+          #   allowPrivilegeEscalation: false
+          #   readOnlyRootFilesystem: true
+          #   capabilities:
+          #     drop: ["ALL"]
+
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits:   { cpu: "250m", memory: "256Mi" }
+
+      # Optional: spread pods across nodes / AZs (when replicas>1)
+      # topologySpreadConstraints:
+      #   - maxSkew: 1
+      #     topologyKey: topology.kubernetes.io/zone
+      #     whenUnsatisfiable: ScheduleAnyway
+      #     labelSelector:
+      #       matchLabels: { app: bds }
+
+      # Optional: co-locate sidecar-enabled workloads or isolate to nodes with more RAM
+      # nodeSelector:
+      #   node.kubernetes.io/instance-type: m6i.xlarge
+
+      # Optional: control where pods can run (taints/tolerations)
+      # tolerations:
+      #   - key: "dedicated"
+      #     operator: "Equal"
+      #     value: "pdf-ml"
+      #     effect: "NoSchedule"

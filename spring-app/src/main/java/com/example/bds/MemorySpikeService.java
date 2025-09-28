@@ -29,31 +29,117 @@ import java.util.List;
 import java.util.stream.Stream;
 
 /**
- * Clean demo:
- *  • predictOnly(features) → NO training side-effects
- *  • train(features, measuredLabelMb) → append to CSV and retrain every N samples
- *  • decide(features) remains available, but now calls predictOnly() (no side-effects)
+ * Service that predicts and (optionally) learns a simple “memory spike” model for PDF processing.
+ *
+ * <h2>Responsibilities</h2>
+ * <ul>
+ *   <li><b>Prediction path:</b> {@link #predictOnly(PdfFeatures)} returns a {@link RouteDecision}.
+ *       If a tiny local model is available, it is used; otherwise the request is proxied to the ML
+ *       sidecar via {@link PredictionService}.</li>
+ *   <li><b>Online training:</b> {@link #train(PdfFeatures, double)} appends labeled rows to a CSV
+ *       and retrains a tiny linear model in-process every {@code bds.retrain-every} samples.</li>
+ *   <li><b>Model lifecycle:</b> loads a persisted JSON model at startup (async) and persists new
+ *       weights after retraining.</li>
+ *   <li><b>Observability:</b> emits counters/timers for predictions and sidecar latency.</li>
+ * </ul>
+ *
+ * <h2>Metrics (Micrometer)</h2>
+ * <ul>
+ *   <li><code>bds.route.decision</code> (counter) — tags:
+ *       <ul>
+ *         <li><code>decision</code>: {@code STANDARD_PATH} or {@code ROUTE_BIG_MEMORY}</li>
+ *         <li><code>source</code>: {@code local}|{@code sidecar}|{@code fallback}</li>
+ *       </ul>
+ *   </li>
+ *   <li><code>bds.sidecar.predict.duration</code> (timer) — latency of calls to sidecar <code>/predict</code></li>
+ * </ul>
+ *
+ * <h2>CSV schema</h2>
+ * Rows appended by {@link #appendTrainingRow(PdfFeatures, double)}:
+ * <pre>
+ * size_mb,pages,image_page_ratio,dpi_estimate,avg_image_size_kb,fonts_embedded_pct,
+ * xref_error_count,ocr_required,producer,label_mb
+ * </pre>
+ *
+ * <h2>Thread-safety</h2>
+ * <ul>
+ *   <li>All public methods are safe to call from reactive chains; file I/O and CPU work are
+ *       offloaded to {@code boundedElastic} where noted.</li>
+ *   <li>Model reads use a volatile reference; writes are synchronized within retrain/persist logic.</li>
+ * </ul>
+ *
+ * <h2>Error handling</h2>
+ * <ul>
+ *   <li>Sidecar failures are logged and mapped to a conservative fallback decision
+ *       (decision {@code STANDARD_PATH}, predicted {@code -1.0}).</li>
+ *   <li>Training I/O errors are logged and skipped; the server continues to run.</li>
+ * </ul>
+ *
+ * <h2>Configuration properties</h2>
+ * <ul>
+ *   <li><code>bds.data-dir</code> (default <code>data</code>)</li>
+ *   <li><code>bds.train-csv</code> (default <code>data/training.csv</code>)</li>
+ *   <li><code>bds.model-file</code> (default <code>data/model.json</code>)</li>
+ *   <li><code>bds.retrain-every</code> (default <code>5</code>)</li>
+ *   <li><code>bds.route-threshold-mb</code> (default <code>3500</code>)</li>
+ * </ul>
+ *
+ * @since 1.0
  */
 @Service
 @Slf4j
 public class MemorySpikeService {
 
-    private final PredictionService sidecar;     // HTTP client to /predict
+    /** HTTP client to the FastAPI sidecar (/predict). */
+    private final PredictionService sidecar;
+
+    /** Jackson mapper for persisting/reading the tiny local model as JSON. */
     private final ObjectMapper mapper;
 
+    /** Base data directory for CSV/model artifacts. */
     private final Path dataDir;
+
+    /** Path to the labeled training CSV. */
     private final Path csvPath;
+
+    /** Path to the persisted local model JSON. */
     private final Path modelPath;
+
+    /** Retrain frequency (every N samples). */
     private final int retrainEvery;
+
+    /** Threshold (MB) to decide routing: >= threshold → ROUTE_BIG_MEMORY. */
     private final double routeThresholdMb;
 
-    // in-memory model cache (lazy-loaded)
+    /** In-memory model cache; set after async load or retrain. */
     private volatile Model model;
 
+    /** Disposable for the async startup load. */
     private Disposable initDisposable;
 
+    /** Micrometer registry for metrics emission. */
     private final MeterRegistry meterRegistry;
 
+    /**
+     * Construct the service with filesystem locations, thresholds, and dependencies.
+     * <p>
+     * Lightweight filesystem operations (ensuring directories and CSV header) are performed here.
+     * Model loading (which may involve disk I/O) is deferred to {@link #initAsyncModelLoad()} on
+     * a bounded elastic scheduler.
+     *
+     * @param sidecar           client to call the sidecar {@code /predict}
+     * @param dataDir           base directory for artifacts (property {@code bds.data-dir})
+     * @param csvPath           training CSV path (property {@code bds.train-csv})
+     * @param modelPath         persisted model path (property {@code bds.model-file})
+     * @param retrainEvery      retrain cadence (property {@code bds.retrain-every})
+     * @param routeThresholdMb  routing threshold in MB (property {@code bds.route-threshold-mb})
+     * @param meterRegistry     (unused) Micrometer registry — see note below
+     * @param meterRegistry1    Micrometer registry actually assigned to the field
+     *                          <br><b>Note:</b> the constructor accepts two {@link MeterRegistry}
+     *                          parameters; only {@code meterRegistry1} is used. Consider removing
+     *                          the unused parameter and wiring a single registry.
+     * @throws IOException if the data directory or CSV header cannot be created
+     */
     public MemorySpikeService(
             PredictionService sidecar,
             @Value("${bds.data-dir:data}") String dataDir,
@@ -69,7 +155,7 @@ public class MemorySpikeService {
         this.dataDir = Paths.get(dataDir);
         this.csvPath = Paths.get(csvPath);
         this.modelPath = Paths.get(modelPath);
-        this.meterRegistry = meterRegistry1;
+        this.meterRegistry = meterRegistry1; // NOTE: only the second registry is used
 
         // These are quick FS ops; OK to do here.
         Files.createDirectories(this.dataDir);
@@ -80,6 +166,12 @@ public class MemorySpikeService {
         // See @PostConstruct below.
     }
 
+    /**
+     * Asynchronously load a previously persisted local model (if present) after the bean is constructed.
+     * <p>
+     * Uses {@code boundedElastic} to avoid blocking event-loop threads during file I/O.
+     * Stores the resulting subscription so it can be disposed in {@link #close()}.
+     */
     @PostConstruct
     void initAsyncModelLoad() {
         initDisposable = Mono.fromRunnable(this::loadModelIfExists)
@@ -89,6 +181,9 @@ public class MemorySpikeService {
                 .subscribe();
     }
 
+    /**
+     * Dispose of the async initialization subscription (if any) during bean shutdown.
+     */
     @PreDestroy
     void close() {
         if (initDisposable != null) {
@@ -98,7 +193,22 @@ public class MemorySpikeService {
 
     /* ===================== PREDICTION ===================== */
 
-    /** Side-effect free prediction: uses local model if present, otherwise the sidecar. */
+    /**
+     * Side-effect-free prediction of a routing decision.
+     * <p>
+     * If a local model has been loaded/trained, it is used to compute the predicted peak (MB)
+     * and corresponding decision. Otherwise, the method calls the sidecar {@code /predict}
+     * endpoint. In both flows, metrics are emitted:
+     * <ul>
+     *   <li><code>bds.route.decision{decision=...,source=local|sidecar|fallback}</code></li>
+     *   <li><code>bds.sidecar.predict.duration</code> — only for sidecar calls</li>
+     * </ul>
+     * If the sidecar call fails, a conservative fallback is returned:
+     * <pre>decision=STANDARD_PATH, predicted_peak_mb=-1.0</pre>
+     *
+     * @param f features for a single document
+     * @return a {@link Mono} emitting the {@link RouteDecision}; errors are mapped to fallback
+     */
     public Mono<RouteDecision> predictOnly(PdfFeatures f) {
         double local = predictLocalOrNa(f);
         if (!Double.isNaN(local)) {
@@ -127,27 +237,40 @@ public class MemorySpikeService {
                     final String decision = "STANDARD_PATH";
                     meterRegistry.counter("bds.route.decision",
                             "decision", decision,
-                                    "source", "fallback").increment();
+                            "source", "fallback").increment();
                     return Mono.just(new RouteDecision("STANDARD_PATH", fallback));
                 });
     }
 
-    /** Kept for convenience – calls predictOnly() now (no training). */
+    /**
+     * Convenience alias for {@link #predictOnly(PdfFeatures)}.
+     *
+     * @param f features for a single document
+     * @return a {@link Mono} emitting the decision
+     */
     public Mono<RouteDecision> decide(PdfFeatures f) {
         return predictOnly(f);
     }
 
-    /** True if a local model is available. */
+    /**
+     * @return {@code true} if a local model has been loaded or trained in this process
+     */
     public boolean hasLocalModel() {
         return model != null;
     }
 
-    /** Current routing threshold (MB). */
+    /**
+     * @return the current routing threshold in megabytes
+     */
     public double threshold() {
         return routeThresholdMb;
     }
 
-    /** Current sample count (rows with a non-negative label in CSV). */
+    /**
+     * Count how many labeled rows exist in the training CSV (label &gt;= 0).
+     *
+     * @return number of usable samples; returns 0 on errors
+     */
     public int sampleCount() {
         if (!Files.exists(csvPath)) return 0;
         try (Stream<String> lines = Files.lines(csvPath, StandardCharsets.UTF_8)) {
@@ -169,7 +292,16 @@ public class MemorySpikeService {
 
     /* ===================== TRAINING ===================== */
 
-    /** Public training entry: append row with measured label and retrain every N rows. */
+    /**
+     * Append a labeled row and retrain the tiny local model every N samples.
+     * <p>
+     * File I/O and CSV scanning are offloaded to {@code boundedElastic} to avoid blocking
+     * reactive event-loop threads.
+     *
+     * @param f               features used as the row's predictors
+     * @param measuredPeakMb  observed label (peak memory in MB) to store
+     * @return a {@link Mono} completing when the append/retrain flow finishes
+     */
     public Mono<Void> train(PdfFeatures f, double measuredPeakMb) {
         // Offload file writes and CSV scanning to boundedElastic to avoid blocking event-loop threads.
         return Mono.fromRunnable(() -> {
@@ -182,6 +314,12 @@ public class MemorySpikeService {
 
     /* ===================== INTERNAL: local model predict ===================== */
 
+    /**
+     * Predict using the in-process linear model if available; otherwise return NaN.
+     *
+     * @param f features
+     * @return predicted peak MB, or {@link Double#NaN} if no local model is loaded
+     */
     private double predictLocalOrNa(PdfFeatures f) {
         Model m = model;
         if (m == null) return Double.NaN;
@@ -193,6 +331,13 @@ public class MemorySpikeService {
         return y;
     }
 
+    /**
+     * Map a predicted peak (MB) to a routing decision using the configured threshold.
+     * Negative predictions (e.g., fallbacks) are treated conservatively as {@code STANDARD_PATH}.
+     *
+     * @param predictedMb predicted peak memory in MB
+     * @return {@code ROUTE_BIG_MEMORY} if {@code predictedMb >= threshold()}, else {@code STANDARD_PATH}
+     */
     private String makeDecision(double predictedMb) {
         if (predictedMb < 0) return "STANDARD_PATH"; // unknown → conservative
         return (predictedMb >= routeThresholdMb) ? "ROUTE_BIG_MEMORY" : "STANDARD_PATH";
@@ -200,6 +345,13 @@ public class MemorySpikeService {
 
     /* ===================== DATA & RETRAIN ===================== */
 
+    /**
+     * Append a single labeled row to the training CSV using a stable column order.
+     * Values are rounded/clamped where appropriate; the producer string is CSV-escaped.
+     *
+     * @param f       features for the predictors
+     * @param labelMb observed peak memory (MB)
+     */
     private synchronized void appendTrainingRow(PdfFeatures f, double labelMb) {
         try (BufferedWriter w = Files.newBufferedWriter(
                 csvPath, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
@@ -213,6 +365,12 @@ public class MemorySpikeService {
         }
     }
 
+    /**
+     * If the number of rows is a multiple of {@link #retrainEvery}, retrain the local model
+     * from the CSV and persist it.
+     * <p>
+     * Errors are logged and ignored; no exception is thrown to the caller.
+     */
     private synchronized void maybeRetrain() {
         try (Stream<String> lines = Files.lines(csvPath, StandardCharsets.UTF_8)) {
             long rows = lines.skip(1).count();
@@ -228,6 +386,16 @@ public class MemorySpikeService {
         }
     }
 
+    /**
+     * Train a tiny linear model from the CSV using batch gradient descent.
+     * <p>
+     * The model is intentionally simple (no external ML deps) and expects 8 numeric features,
+     * excluding the categorical {@code producer}.
+     *
+     * @param path path to the CSV file
+     * @return a new {@link Model} instance
+     * @throws IOException if the CSV cannot be read
+     */
     private Model trainFromCsv(Path path) throws IOException {
         List<double[]> X = new ArrayList<>();
         List<Double> y = new ArrayList<>();
@@ -293,6 +461,12 @@ public class MemorySpikeService {
 
     /* ===================== MODEL IO ===================== */
 
+    /**
+     * Load a previously persisted model from {@link #modelPath}, if present.
+     * <p>
+     * On success, assigns {@link #model}. On any error, logs a warning and keeps
+     * running without a local model (sidecar will be used).
+     */
     private void loadModelIfExists() {
         if (Files.exists(modelPath)) {
             try {
@@ -307,6 +481,11 @@ public class MemorySpikeService {
         }
     }
 
+    /**
+     * Persist the model to {@link #modelPath} as JSON, overwriting any existing file.
+     *
+     * @param m model to write
+     */
     private synchronized void persistModel(Model m) {
         try {
             Files.createDirectories(modelPath.getParent());
@@ -322,6 +501,12 @@ public class MemorySpikeService {
         }
     }
 
+    /**
+     * Ensure the training CSV exists and contains a header row. Creates parent
+     * directories as needed.
+     *
+     * @throws IOException if the file cannot be created
+     */
     private void ensureCsvHeader() throws IOException {
         if (!Files.exists(csvPath)) {
             Files.createDirectories(csvPath.getParent());
@@ -336,25 +521,42 @@ public class MemorySpikeService {
 
     /* ===================== helpers ===================== */
 
+    /**
+     * CSV-escape a string value (double-quote quoting).
+     *
+     * @param s input
+     * @return escaped value wrapped in quotes; empty string if null
+     */
     private static String safeCsv(String s) {
         if (s == null) return "";
         String v = s.replace("\"", "\"\"");
         return "\"" + v + "\"";
     }
 
+    /**
+     * Format a double for CSV with 4 decimal places; returns {@code 0.0} for NaN/Infinity.
+     */
     private static String num(double v) {
         if (Double.isNaN(v) || Double.isInfinite(v)) return "0.0";
         return String.format(java.util.Locale.ROOT, "%.4f", v);
     }
 
+    /**
+     * Parse a string to double; returns {@code 0.0} if blank or unparsable.
+     */
     private static double parse(String s) {
         if (s == null || s.isBlank()) return 0.0;
         try { return Double.parseDouble(s); } catch (Exception e) { return 0.0; }
     }
 
+    /** Round to 1 decimal place. */
     private static double round1(double v) { return Math.round(v * 10.0) / 10.0; }
+    /** Round to 2 decimal places. */
     private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
 
+    /**
+     * Pretty-print a double array as <code>[a, b, c]</code> with 2-decimal rounding.
+     */
     private static String arr(double[] w) {
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < w.length; i++) {
@@ -364,6 +566,11 @@ public class MemorySpikeService {
         return sb.append("]").toString();
     }
 
+    /**
+     * Immutable, minimal linear model: {@code y = dot(weights, x) + bias}.
+     * <p>
+     * <b>Dimensions:</b> weights length is 8 (matching the numeric features).
+     */
     @Getter
     public static final class Model {
         private final double[] weights; // length 8
@@ -374,13 +581,26 @@ public class MemorySpikeService {
             this.bias = bias;
         }
 
-        // aliases for stats/ML convention (optional)
+        /** Alias for stats/ML convention. */
         public double[] beta() { return weights; }
+        /** Alias for stats/ML convention. */
         public double intercept() { return bias; }
     }
 
+    /**
+     * Snapshot of the current in-memory model and dataset state for diagnostics.
+     *
+     * @param beta         a copy of the current weights (may be empty if no model)
+     * @param samples      number of labeled samples known
+     * @param thresholdMb  active routing threshold
+     */
     public record ModelSnapshot(double[] beta, int samples, double thresholdMb) {}
 
+    /**
+     * Create a diagnostic snapshot of the current model, sample count, and threshold.
+     *
+     * @return a {@link ModelSnapshot} with defensive copying of weights
+     */
     public ModelSnapshot snapshot() {
         double[] beta = (this.model != null && this.model.beta() != null)
                 ? this.model.beta().clone()

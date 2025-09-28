@@ -2,59 +2,124 @@
 # Purpose: One file to create everything needed for local dev:
 # - Namespace
 # - Deployment (Spring app + FastAPI sidecar in the same Pod)
-# - Service to expose the Spring app internally (port-forward externally)
+# - Service to expose the Spring app internally (use port-forward externally)
 #
-# Use:
+# Usage:
 #   kubectl apply -f k8s/k8s.yaml
 #   kubectl -n pdf-ml port-forward svc/bds 8033:8033
+#
+# Notes:
+# - This runs two containers in ONE Pod. They share the same network namespace,
+#   so http://127.0.0.1:<port> in one container reaches the other.
+# - For production, you may prefer separate Deployments + a ClusterIP Service
+#   for the sidecar, then point the Spring app to http://<sidecar-svc>:8000.
 
+# -------------------------
+# Namespace (isolated scope)
+# -------------------------
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: pdf-ml  # isolated workspace for this app
+  name: pdf-ml  # isolated workspace for this app (create before or with this file)
 ---
+# -----------------------------------------------
+# Deployment: Spring WebFlux + FastAPI in 1 Pod
+# -----------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: bds
   namespace: pdf-ml
 spec:
-  replicas: 1  # scale up later after shadow-mode validation
+  replicas: 1  # scale up after shadow-mode validation; consider an HPA later
+  # selector must match pod template labels (below) or rollout will fail
   selector:
     matchLabels: { app: bds }
   template:
     metadata:
-      labels: { app: bds }
+      labels: { app: bds }  # used by selector and Service
+      # annotations:
+      #   prometheus.io/scrape: "true"
+      #   prometheus.io/port: "8033"
+      #   prometheus.io/path: "/actuator/prometheus"
     spec:
-      # Two containers share the SAME network namespace.
-      # 127.0.0.1 in one container can reach the other.
+      # Optional: share ephemeral storage for model/training artifacts across both containers
+      # volumes:
+      #   - name: data-dir
+      #     emptyDir: {}  # swap to a PVC for persistence across pod restarts
       containers:
-        # --- Spring Boot app (Java) ---
+        # -----------------------------
+        # 1) Spring Boot app (Java 21)
+        # -----------------------------
         - name: bds-app
-          image: localhost:5001/bds-app:dev
-          imagePullPolicy: Always
+          image: localhost:5001/bds-app:dev     # local registry image (kind’s local registry on :5001)
+          imagePullPolicy: Always               # Always pull the :dev tag (use IfNotPresent for immutable tags)
           ports:
-            - containerPort: 8033
+            - containerPort: 8033               # Spring server.port
               name: http
           env:
+            # Map sidecar base URL. Because both containers are in one Pod,
+            # the Spring app can use localhost to reach the sidecar.
             - name: TRIAGE_BASE_URL
               value: http://127.0.0.1:8000
-            - name: MEMSPIKE_THRESHOLD_MB
+
+            # Routing threshold (MB). Your Spring property is `bds.route-threshold-mb`.
+            # Spring’s relaxed binding expects env var `BDS_ROUTE_THRESHOLD_MB`.
+            # If you keep MEMSPIKE_THRESHOLD_MB, ensure your code reads it explicitly
+            # (e.g., @Value("${MEMSPIKE_THRESHOLD_MB:3500}")).
+            - name: BDS_ROUTE_THRESHOLD_MB
               value: "3500"
+
+            # Keep management endpoints on the same port (8033). If you set a different
+            # management port, probes/Service must target that port instead.
             - name: MANAGEMENT_SERVER_PORT
               value: "8033"
+
+            # Optional: disable Datadog export in local dev (if enabled in application.yaml)
+            # - name: MANAGEMENT_METRICS_EXPORT_DATADOG_ENABLED
+            #   value: "false"
+
+          # Mount any shared volumes if enabled above
+          # volumeMounts:
+          #   - name: data-dir
+          #     mountPath: /workspace/data
+
+          # Health probes — require:
+          #   management.endpoint.health.probes.enabled=true
+          #   and liveness/readiness groups exposed
           livenessProbe:
-            httpGet: { path: /actuator/health/liveness, port: http }
-            initialDelaySeconds: 20
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 20   # give JVM time to warm up
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
-            httpGet: { path: /actuator/health/readiness, port: http }
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # Resource sizing — tune with telemetry (bds.route.decision, heap peaks, GC)
           resources:
             requests: { cpu: "200m", memory: "512Mi" }
-            limits: { cpu: "500m", memory: "1Gi" }
+            limits:   { cpu: "500m", memory: "1Gi" }
 
+          # Security hardening (enable once verified)
+          # securityContext:
+          #   runAsNonRoot: true
+          #   allowPrivilegeEscalation: false
+          #   readOnlyRootFilesystem: true
+          #   capabilities:
+          #     drop: ["ALL"]
+
+        # ---------------------------------------
+        # 2) FastAPI sidecar (mem-spike-scorer)
+        # ---------------------------------------
         - name: mem-spike-scorer
           image: localhost:5001/mem-spike-scorer:dev
           imagePullPolicy: Always
@@ -62,27 +127,57 @@ spec:
             - containerPort: 8000
               name: memscore
           livenessProbe:
-            httpGet: { path: /health, port: memscore }
-            initialDelaySeconds: 10
+            httpGet:
+              path: /health           # sidecar returns 200 OK with JSON
+              port: memscore
+            initialDelaySeconds: 10   # allow model load/warmup
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
           readinessProbe:
-            httpGet: { path: /health, port: memscore }
+            httpGet:
+              path: /health
+              port: memscore
             initialDelaySeconds: 5
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # volumeMounts:
+          #   - name: data-dir
+          #     mountPath: /app/models  # if the sidecar reads/writes model artifacts
+
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
-            limits: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "250m", memory: "256Mi" }
 
+          # securityContext:
+          #   runAsNonRoot: true
+          #   allowPrivilegeEscalation: false
+          #   readOnlyRootFilesystem: true
+          #   capabilities:
+          #     drop: ["ALL"]
 ---
+# ---------------------------------------
+# ClusterIP Service for the Spring app
+# ---------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: bds
   namespace: pdf-ml
 spec:
-  # Selects Pods with this label set by Deployment template
+  # Selects Pods labeled app=bds (set by the Deployment template)
   selector: { app: bds }
   ports:
     - name: http
-      port: 8033        # cluster-internal port
-      targetPort: http  # maps to containerPort:8033 in the Pod
+      port: 8033        # Cluster-internal port
+      targetPort: http  # Maps to containerPort:8033 on the Pod
+  type: ClusterIP       # Default; use `kubectl port-forward` for localhost access
+  # For NodePort (optional local testing without port-forward), uncomment:
+  # type: NodePort
+  # ports:
+  #   - name: http
+  #     port: 8033
+  #     targetPort: http
+  #     nodePort: 30033   # must be within 30000-32767
