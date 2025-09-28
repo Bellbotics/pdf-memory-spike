@@ -3,14 +3,22 @@ services:
     build:
       context: ./sidecar
       dockerfile: Dockerfile.sidecar
-    image: mem-spike-scorer:dev
     ports:
       - "8000:8000"
-    environment:
-      - PIPELINE_PATH=/models/pipeline.pkl
+    # If your pipeline is produced by training, you can either bake it
+    # into the image or mount a volume (uncomment to mount):
+    # volumes:
+    #   - ./training/artifacts:/models:ro
+    # environment:
+    #   - PIPELINE_PATH=/models/pipeline.pkl
+
   spring:
-    build: ./spring-app
-    ports: ["8033:8033"]
+    build:
+      context: ./spring-app
+      dockerfile: Dockerfile.spring   # <-- use your file name here
+    ports:
+      - "8033:8033"
     environment:
       - TRIAGE_BASE_URL=http://mem-spike-scorer:8000
-    depends_on: [mem-spike-scorer]
+    depends_on:
+      - mem-spike-scorer

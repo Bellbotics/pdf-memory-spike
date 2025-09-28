@@ -13,3 +13,7 @@ springdoc:
     enabled: false
   swagger-ui:
     enabled: false
+
+logging:
+  level:
+    io.netty.resolver.dns: WARN

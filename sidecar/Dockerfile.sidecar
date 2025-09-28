@@ -1,20 +1,30 @@
+# sidecar/Dockerfile.sidecar
+
 FROM python:3.13-slim
+
+# Run as root for OS package installs
+USER root
 WORKDIR /app
 
+# System libs needed by scikit-learn wheels (OpenMP)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for runtime
 RUN useradd -ms /bin/bash appuser
+
+# Python deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# App code (include your baked-in model if you have one under sidecar/models)
+COPY . /app
+
+ENV PIPELINE_PATH=/app/models/pipeline.pkl
+EXPOSE 8000
+
+# Drop privileges only AFTER installs are complete
 USER appuser
 
-# system libs (scikit-learn wheels should avoid compile; libgomp is safe)
-RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
-
-# model goes under /models inside image
-COPY models/pipeline.pkl /models/pipeline.pkl
-COPY app.py /app/app.py
-
-ENV PIPELINE_PATH=/models/pipeline.pkl
-EXPOSE 8000
-CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8000","--workers","1"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

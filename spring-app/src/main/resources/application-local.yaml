@@ -1,0 +1,8 @@
+management:
+  datadog:
+    metrics:
+      export:
+        enabled: false
+logging:
+  level:
+    io.micrometer.datadog: WARN

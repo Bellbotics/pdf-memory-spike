@@ -1,5 +1,15 @@
-FROM eclipse-temurin:21-jre
+# spring-app/Dockerfile.spring
+
+# ---- Build stage
+FROM maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /app
-COPY target/bds-app-0.0.1-SNAPSHOT.jar /app/app.jar
+COPY . .
+RUN mvn -q -DskipTests package
+
+# ---- Runtime stage
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+ENV JAVA_OPTS=""
 EXPOSE 8033
-ENTRYPOINT ["java","-jar","/app/app.jar"]
+COPY --from=build /app/target/bds-app-0.0.1-SNAPSHOT.jar /app/app.jar
+ENTRYPOINT ["sh","-c","exec java $JAVA_OPTS -jar /app/app.jar"]
