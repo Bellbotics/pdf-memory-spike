@@ -1,7 +1,8 @@
 package com.example.bds;
 
+import com.example.bds.dto.PdfFeatures;
 import com.example.bds.ml.MemorySampler;
-import com.example.bds.ml.PredictionService;
+import com.example.bds.pdf.PdfFeatureExtractor;
 import lombok.RequiredArgsConstructor;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
@@ -22,9 +23,10 @@ import java.nio.ByteBuffer;
 @Validated
 public class UploadController {
 
-    private final PredictionService predictionService;
-
     private static final long MAX_BYTES = 50L * 1024L * 1024L; // 50 MB
+
+    private final MemorySpikeService memorySpikeService;
+    private final PdfFeatureExtractor extractor = new PdfFeatureExtractor();
 
     @PostMapping(
             path = "/pdf",
@@ -33,15 +35,13 @@ public class UploadController {
     )
     public Mono<UploadResponse> uploadAndRoute(@RequestPart("file") FilePart file,
                                                @RequestPart(name = "train", required = false) String trainFlag) {
-
-        // best-effort content-type check (some browsers omit it)
         var ct = file.headers().getContentType();
         if (ct != null && !MediaType.APPLICATION_PDF.includes(ct)) {
             return Mono.error(new IllegalArgumentException("Only application/pdf is supported"));
         }
 
         final boolean doTrain =
-                trainFlag == null || // treat missing as "checked" so the demo trains by default
+                trainFlag == null ||
                         "true".equalsIgnoreCase(trainFlag) ||
                         "on".equalsIgnoreCase(trainFlag);
 
@@ -49,39 +49,39 @@ public class UploadController {
                 .flatMap(buf -> {
                     try {
                         byte[] bytes = toByteArrayAndRelease(buf);
+                        if (bytes.length == 0) return Mono.error(new IllegalArgumentException("Empty upload"));
+                        if (bytes.length > MAX_BYTES) return Mono.error(new IllegalArgumentException("File too large (max 50MB)"));
 
-                        if (bytes.length == 0) {
-                            return Mono.error(new IllegalArgumentException("Empty upload"));
-                        }
-                        if (bytes.length > MAX_BYTES) {
-                            return Mono.error(new IllegalArgumentException("File too large (max 50MB)"));
-                        }
+                        final PdfFeatures features = extractor.extract(bytes);
 
-                        // 1) get a prediction (local model if present, otherwise sidecar)
-                        return predictionService.predict(bytes)
+                        final boolean usedLocalBefore = memorySpikeService.hasLocalModel();
+                        final int samplesBefore = memorySpikeService.sampleCount();
+
+                        // 1) predict (no side-effects)
+                        return memorySpikeService.predictOnly(features)
                                 .flatMap(predBefore -> {
-                                    // 2) run your real processing under the memory sampler to get a label
+                                    // 2) measure real processing peak (your real PDF work goes here)
                                     var sampled = MemorySampler.measure(() -> {
-                                        // TODO replace with your real PDF processing (e.g., watermark with PDFBox)
+                                        // TODO: replace with actual PDF processing (e.g., watermark via PDFBox)
                                         int s = 0; for (byte b : bytes) s += (b & 0xFF);
                                         return s;
                                     }, 25);
 
-                                    // 3) optionally train on the measured peak
+                                    // 3) train on measured label (only if requested)
                                     Mono<Void> trainMono = doTrain
-                                            ? predictionService.train(bytes, sampled.peakMb())
+                                            ? memorySpikeService.train(features, sampled.peakMb())
                                             : Mono.empty();
 
-                                    // 4) after training (or not), predict again to show effect and respond
-                                    return trainMono.then(predictionService.predict(bytes))
+                                    // 4) predict again after (no side-effects)
+                                    return trainMono.then(memorySpikeService.predictOnly(features))
                                             .map(predAfter -> new UploadResponse(
                                                     predAfter.decision(),
-                                                    predAfter.predictedPeakMb(),
-                                                    predictionService.threshold(),
-                                                    predBefore.usingLocalModel(),
-                                                    predBefore.samples(),
-                                                    predAfter.usingLocalModel(),
-                                                    predAfter.samples(),
+                                                    predAfter.predicted_peak_mb(),
+                                                    memorySpikeService.threshold(),
+                                                    usedLocalBefore,
+                                                    samplesBefore,
+                                                    memorySpikeService.hasLocalModel(),
+                                                    memorySpikeService.sampleCount(),
                                                     sampled.peakMb(),
                                                     doTrain
                                             ));
