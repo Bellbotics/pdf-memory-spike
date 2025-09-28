@@ -5,11 +5,15 @@ import com.example.bds.dto.RouteDecision;
 import com.example.bds.ml.PredictionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -46,13 +50,17 @@ public class MemorySpikeService {
     // in-memory model cache (lazy-loaded)
     private volatile Model model;
 
+    private Disposable initDisposable;
+
+    private final MeterRegistry meterRegistry;
+
     public MemorySpikeService(
             PredictionService sidecar,
             @Value("${bds.data-dir:data}") String dataDir,
             @Value("${bds.train-csv:data/training.csv}") String csvPath,
             @Value("${bds.model-file:data/model.json}") String modelPath,
             @Value("${bds.retrain-every:5}") int retrainEvery,
-            @Value("${bds.route-threshold-mb:3500}") double routeThresholdMb
+            @Value("${bds.route-threshold-mb:3500}") double routeThresholdMb, MeterRegistry meterRegistry, MeterRegistry meterRegistry1
     ) throws IOException {
         this.sidecar = sidecar;
         this.retrainEvery = retrainEvery;
@@ -61,6 +69,7 @@ public class MemorySpikeService {
         this.dataDir = Paths.get(dataDir);
         this.csvPath = Paths.get(csvPath);
         this.modelPath = Paths.get(modelPath);
+        this.meterRegistry = meterRegistry1;
 
         // These are quick FS ops; OK to do here.
         Files.createDirectories(this.dataDir);
@@ -73,11 +82,18 @@ public class MemorySpikeService {
 
     @PostConstruct
     void initAsyncModelLoad() {
-        Mono.fromRunnable(this::loadModelIfExists)
+        initDisposable = Mono.fromRunnable(this::loadModelIfExists)
                 .subscribeOn(Schedulers.boundedElastic())
                 .doOnSubscribe(s -> log.info("Initializing local model (async)… path={}", modelPath.toAbsolutePath()))
                 .doOnError(e -> log.warn("Async model init failed: {}", e.toString()))
                 .subscribe();
+    }
+
+    @PreDestroy
+    void close() {
+        if (initDisposable != null) {
+            initDisposable.dispose();
+        }
     }
 
     /* ===================== PREDICTION ===================== */
@@ -86,16 +102,32 @@ public class MemorySpikeService {
     public Mono<RouteDecision> predictOnly(PdfFeatures f) {
         double local = predictLocalOrNa(f);
         if (!Double.isNaN(local)) {
-            return Mono.just(new RouteDecision(makeDecision(local), round1(local)));
+            final String decision = makeDecision(local);
+            meterRegistry.counter("bds.route.decision",
+                    "decision", decision,
+                    "source", "local").increment();
+            return Mono.just(new RouteDecision(decision, round1(local)));
         }
         // No local model → log clearly and use sidecar.
         log.info("No local model loaded or available at {} — using sidecar for prediction.",
                 modelPath.toAbsolutePath());
+        var sample = Timer.start(meterRegistry);
         return sidecar.predictViaSidecar(f)
+                .doOnTerminate(() -> sample.stop(meterRegistry.timer("bds.sidecar.predict.duration")))
                 .doOnSubscribe(s -> log.debug("Calling sidecar /predict…"))
+                .map(rd -> {
+                    meterRegistry.counter("bds.route.decision",
+                            "decision", rd.decision(),
+                            "source", "sidecar").increment();
+                    return rd;
+                })
                 .onErrorResume(err -> {
                     log.warn("Sidecar predict failed; returning conservative default: {}", err.toString());
                     double fallback = -1.0; // “unknown” sentinel
+                    final String decision = "STANDARD_PATH";
+                    meterRegistry.counter("bds.route.decision",
+                            "decision", decision,
+                                    "source", "fallback").increment();
                     return Mono.just(new RouteDecision("STANDARD_PATH", fallback));
                 });
     }

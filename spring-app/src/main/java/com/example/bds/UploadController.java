@@ -2,6 +2,7 @@ package com.example.bds;
 
 import com.example.bds.ml.MemorySampler;
 import com.example.bds.pdf.PdfFeatureExtractor;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.buffer.DataBuffer;
@@ -32,6 +33,7 @@ public class UploadController {
 
     private final MemorySpikeService memorySpikeService;
     private final PdfFeatureExtractor extractor = new PdfFeatureExtractor();
+    private final MeterRegistry meterRegistry;
 
     @PostMapping(
             path = "/pdf",
@@ -41,7 +43,7 @@ public class UploadController {
     public Mono<UploadResponse> uploadAndRoute(@RequestPart("file") FilePart file,
                                                @RequestPart(name = "train", required = false) String trainFlag) {
         var ct = file.headers().getContentType();
-        if (ct != null && !MediaType.APPLICATION_PDF.includes(ct)) {
+        if (ct == null || !MediaType.APPLICATION_PDF.isCompatibleWith(ct)) {
             return Mono.error(new IllegalArgumentException("Only application/pdf is supported"));
         }
 
@@ -54,11 +56,20 @@ public class UploadController {
             .flatMap(buf -> {
                 try {
                     byte[] bytes = toByteArrayAndRelease(buf);
+                    if (bytes.length < 5 || bytes[0] != '%' || bytes[1] != 'P' || bytes[2] != 'D' || bytes[3] != 'F' || bytes[4] != '-') {
+                        throw new IllegalArgumentException("Not a valid PDF header");
+                    }
                     if (bytes.length == 0) return Mono.error(new IllegalArgumentException("Empty upload"));
                     if (bytes.length > maxBytes) return Mono.error(new IllegalArgumentException("File too large"));
+                    meterRegistry.summary("bds.upload.bytes").record(bytes.length);
                     // Extract features off the event loop
                     return Mono.fromCallable(() -> extractor.extract(bytes))
                         .subscribeOn(Schedulers.boundedElastic())
+                        .elapsed()
+                        .map(tuple -> {
+                            meterRegistry.timer("bds.pdf.extract.duration").record(tuple.getT1(), java.util.concurrent.TimeUnit.MILLISECONDS);
+                            return tuple.getT2();
+                        })
                         .flatMap(features -> {
                             final boolean usedLocalBefore = memorySpikeService.hasLocalModel();
                             final int samplesBefore = memorySpikeService.sampleCount();
