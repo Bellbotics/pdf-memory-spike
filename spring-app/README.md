@@ -1,103 +1,36 @@
-# PDF Memory Spike Predictor API
+# Spring WebFlux Service
 
-This document describes the REST API exposed by the **Intake Controller** in the `pdf-memory-spike` project.  
-It enables clients to estimate the peak memory usage of an uploaded PDF and decide which processing path to use.
-
----
-
-## Base URL
-```
-http://<host>:8033/v1/intake
-```
-
-In local development (with `kubectl port-forward`):
-```
-http://localhost:8033/v1/intake
-```
-
----
+Reactive service that accepts PDF uploads, extracts features (PDFBox), predicts memory spikes (sidecar or local model), measures actual peak memory, and (optionally) trains a tiny in-process model.
 
 ## Endpoints
 
-### `POST /route`
+- POST /v1/upload/pdf — multipart/form-data
+  - file: PDF (application/pdf) — capped by bds.max-bytes (default 50 MiB)
+  - train: optional (true|on|false) — default on
+- POST /v1/intake/route — JSON features (no file upload)
+- GET /v1/model — { beta[], samples, threshold_mb } snapshot
 
-Analyze PDF features and return a routing decision.
+Actuator (/actuator/**)
+- health, metrics, prometheus (always)
+- info, env (local profile)
 
-- **Consumes:** `application/json`
-- **Produces:** `application/json`
+## Run (local)
 
-#### Request Body
-A JSON object representing the features of the PDF:
-
-| Field                | Type    | Description                                                                 |
-|---------------------|---------|-----------------------------------------------------------------------------|
-| `size_mb`           | number  | Total file size of the PDF (in MB).                                         |
-| `pages`             | integer | Total number of pages.                                                      |
-| `image_page_ratio`  | number  | Fraction of pages that are image-based (0.0 to 1.0).                        |
-| `dpi_estimate`      | integer | Approximate DPI of embedded images.                                         |
-| `avg_image_size_kb` | number  | Average size of embedded images (in KB).                                    |
-| `fonts_embedded_pct`| number  | Fraction of fonts embedded (0.0 to 1.0).                                    |
-| `xref_error_count`  | integer | Number of cross-reference (xref) errors detected.                           |
-| `ocr_required`      | integer | Whether OCR is required (`1 = yes`, `0 = no`).                              |
-| `producer`          | string  | The software that produced the PDF (e.g., `Adobe`, `PDFBox`, `Scanner`).    |
-
-#### Example Request
-```http
-POST /v1/intake/route
-Content-Type: application/json
-
-{
-  "size_mb": 18.0,
-  "pages": 420,
-  "image_page_ratio": 0.92,
-  "dpi_estimate": 300,
-  "avg_image_size_kb": 850.0,
-  "fonts_embedded_pct": 0.35,
-  "xref_error_count": 2,
-  "ocr_required": 1,
-  "producer": "Unknown"
-}
+```bash
+./mvnw -q spring-boot:run   -Dspring-boot.run.profiles=local   -Dspring-boot.run.arguments="--triage.base-url=http://127.0.0.1:8000 --bds.retrain-every=1"
 ```
 
----
+UI at http://127.0.0.1:8033/
 
-#### Response
-A JSON object containing the predicted peak memory usage and the routing decision.
+## Observability
 
-| Field               | Type    | Description                                                                 |
-|---------------------|---------|-----------------------------------------------------------------------------|
-| `decision`          | string  | Routing decision (`STANDARD_PATH` or `ROUTE_BIG_MEMORY`).                   |
-| `predicted_peak_mb` | number  | Predicted peak memory usage in MB.                                          |
+- bds.pdf.extract.duration — feature extraction timer
+- bds.sidecar.predict.duration — sidecar call timer
+- bds.upload.bytes — upload size summary
+- bds.route.decision{decision,source} — counter
 
-#### Example Response
-```json
-{
-  "decision": "ROUTE_BIG_MEMORY",
-  "predicted_peak_mb": 4820.5
-}
-```
+## Config keys used
 
----
-
-## Error Handling
-- If the predictor sidecar is unreachable or an error occurs:
-    - The fallback decision will be `ROUTE_BIG_MEMORY`.
-    - The predicted value will be `-1`.
-
-Example:
-```json
-{
-  "decision": "ROUTE_BIG_MEMORY",
-  "predicted_peak_mb": -1.0
-}
-```
-
----
-
-## Notes for Developers
-- The threshold for deciding between `STANDARD_PATH` and `ROUTE_BIG_MEMORY` is configurable via:
-```yaml
-memSpike:
-  thresholdMb: 3500
-```
-- Actual threshold tuning should be based on observed pod memory envelopes in production.
+- triage.base-url (required)
+- bds.max-bytes, bds.data-dir, bds.train-csv, bds.model-file
+- bds.retrain-every, bds.route-threshold-mb
