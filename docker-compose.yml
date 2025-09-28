@@ -8,3 +8,9 @@ services:
       - "8000:8000"
     environment:
       - PIPELINE_PATH=/models/pipeline.pkl
+  spring:
+    build: ./spring-app
+    ports: ["8033:8033"]
+    environment:
+      - TRIAGE_BASE_URL=http://mem-spike-scorer:8000
+    depends_on: [mem-spike-scorer]

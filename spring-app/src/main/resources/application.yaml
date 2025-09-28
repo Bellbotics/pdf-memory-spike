@@ -4,8 +4,8 @@ server:
 spring:
   servlet:
     multipart:
-      max-file-size: 10MB
-      max-request-size: 10MB
+      max-file-size: 50MB
+      max-request-size: 50MB
   http:
     codecs:
       max-in-memory-size: 50MB
@@ -21,6 +21,7 @@ bds:
   model-file: data/model.json
   retrain-every: 5
   route-threshold-mb: 3500
+  max-bytes: 52428800 # 50 MiB; keep in sync with controller property
 
 memSpike:
   thresholdMb: 3500

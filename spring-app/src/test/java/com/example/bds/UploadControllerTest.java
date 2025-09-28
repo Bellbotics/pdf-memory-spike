@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.reactive.AutoConfigureWebTestClient;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.MultipartBodyBuilder;
@@ -17,6 +18,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.reactive.server.WebTestClient;
 import reactor.core.publisher.Mono;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -49,6 +51,8 @@ class UploadControllerTest {
         r.add("bds.retrain-every", () -> "9999");
         // if anything accidentally hits the sidecar, point to a non-routable address
         r.add("triage.base-url", () -> "http://127.0.0.1:65535");
+        // cap upload size at 5 MB so we can exercise an "oversized" case deterministically
+        r.add("bds.max-bytes", () -> String.valueOf(5 * 1024 * 1024));
     }
 
     @Test
@@ -92,5 +96,65 @@ class UploadControllerTest {
                 .jsonPath("$.samples_after").isEqualTo(1)
                 .jsonPath("$.measured_peak_mb").isNumber()
                 .jsonPath("$.trained_this_upload").isEqualTo(true);
+    }
+
+    @Test
+    void nonPdfContentType_rejected4xx() {
+        // Build a plain-text payload and mark the *part* as text/plain.
+        byte[] txt = "not a pdf".getBytes(StandardCharsets.UTF_8);
+        ByteArrayResource res = new ByteArrayResource(txt) {
+            @Override public String getFilename() { return "note.txt"; }
+        };
+
+        MultipartBodyBuilder builder = new MultipartBodyBuilder();
+        builder.part("file", res)
+                .filename("note.txt")
+                .contentType(MediaType.TEXT_PLAIN);
+
+        web.post().uri("/v1/upload/pdf")
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .bodyValue(builder.build())
+                .exchange()
+                .expectStatus().is4xxClientError();
+    }
+
+    @Test
+    void emptyUpload_rejected4xx() {
+        // Zero-length "PDF" content; controller should reject empty uploads.
+        byte[] empty = new byte[0];
+        ByteArrayResource res = new ByteArrayResource(empty) {
+            @Override public String getFilename() { return "empty.pdf"; }
+        };
+
+        MultipartBodyBuilder builder = new MultipartBodyBuilder();
+        builder.part("file", res)
+                .filename("empty.pdf")
+                .contentType(MediaType.APPLICATION_PDF);
+
+        web.post().uri("/v1/upload/pdf")
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .bodyValue(builder.build())
+                .exchange()
+                .expectStatus().is4xxClientError();
+    }
+
+    @Test
+    void oversizedUpload_rejected4xx() {
+        // Craft a payload larger than bds.max-bytes (5 MB set above): use 6 MB.
+        byte[] big = new byte[6 * 1024 * 1024];
+        ByteArrayResource res = new ByteArrayResource(big) {
+            @Override public String getFilename() { return "big.pdf"; }
+        };
+
+        MultipartBodyBuilder builder = new MultipartBodyBuilder();
+        builder.part("file", res)
+                .filename("big.pdf")
+                .contentType(MediaType.APPLICATION_PDF);
+
+        web.post().uri("/v1/upload/pdf")
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .bodyValue(builder.build())
+                .exchange()
+                .expectStatus().is4xxClientError();
     }
 }

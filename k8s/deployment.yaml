@@ -1,5 +1,5 @@
 # k8s/deployment.yaml
-# Purpose: Defines how to run the application (Pod template + replicas).
+# Purpose: Defines how to run the application (Pod template  replicas).
 # Use when you prefer split manifests (svc/deploy separate) or in CI pipelines.
 
 apiVersion: apps/v1
@@ -27,13 +27,23 @@ spec:
               value: http://127.0.0.1:8000
             - name: MEMSPIKE_THRESHOLD_MB
               value: "3500"
+            - name: MANAGEMENT_SERVER_PORT
+              value: "8033"
             - name: DATADOG_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: datadog-keys
                   key: DD_API_KEY
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
           readinessProbe:
-            httpGet: { path: /actuator/health, port: http }
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:
@@ -45,9 +55,17 @@ spec:
           ports:
             - containerPort: 8000
               name: memscore
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: memscore
+            initialDelaySeconds: 10
+            periodSeconds: 10
           readinessProbe:
-            httpGet: { path: /healthz, port: memscore }
-            initialDelaySeconds: 3
+            httpGet:
+              path: /health
+              port: memscore
+            initialDelaySeconds: 5
             periodSeconds: 5
           resources:
             requests: { cpu: "50m", memory: "128Mi" }

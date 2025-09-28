@@ -12,45 +12,60 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.MultipartBodyBuilder;
-import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
 import java.io.ByteArrayOutputStream;
 
-import static com.github.tomakehurst.wiremock.client.WireMock.*;     // <-- WireMock statics
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 
 /**
  * Full integration test for the /v1/upload/pdf endpoint.
  * Starts a WireMock server that stubs the sidecar's /predict API.
  */
-@SpringBootTest
-@AutoConfigureWebTestClient
-@TestPropertySource(properties = {
+@SpringBootTest(properties = {
         "spring.profiles.active=test",
-        "management.metrics.export.datadog.enabled=false",
-        "triage.base-url=http://localhost:18080" // your app should read this for the sidecar base URL
+        "management.datadog.metrics.export.enabled=false"
 })
+@AutoConfigureWebTestClient
 class UploadControllerIT {
 
-    private static WireMockServer wm;
+    // Start WireMock on a dynamic port to avoid collisions with other tests.
+    private static final WireMockServer wm = new WireMockServer(options().dynamicPort());
 
     @Autowired WebTestClient web;
 
+    /**
+     * Register dynamic properties BEFORE the Spring context is created.
+     * We start WireMock here so we can inject its port into the app property.
+     */
+    @DynamicPropertySource
+    static void registerProps(DynamicPropertyRegistry r) {
+        if (!wm.isRunning()) {
+            wm.start();
+        }
+        r.add("triage.base-url", () -> "http://127.0.0.1:" + wm.port());
+    }
+
     @BeforeAll
-    static void startWiremock() {
-        wm = new WireMockServer(options().port(18080));
-        wm.start();
+    static void stubSidecar() {
         wm.stubFor(post(urlEqualTo("/predict"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"predicted_peak_mb\":4800.0,\"decision\":\"ROUTE_BIG_MEMORY\",\"threshold_mb\":3500}")
+                        .withBody("{\"predicted_peak_mb\":4800.0," +
+                                "\"decision\":\"ROUTE_BIG_MEMORY\"," +
+                                "\"threshold_mb\":3500}")
                         .withStatus(200)));
     }
 
     @AfterAll
     static void stopWiremock() {
-        if (wm != null) wm.stop();
+        if (wm.isRunning()) wm.stop();
     }
 
     @Test

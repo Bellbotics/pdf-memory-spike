@@ -31,43 +31,48 @@ spec:
       containers:
         # --- Spring Boot app (Java) ---
         - name: bds-app
-          image: localhost:5001/bds-app:dev   # built/pushed to local registry
+          image: localhost:5001/bds-app:dev
           imagePullPolicy: Always
           ports:
             - containerPort: 8033
               name: http
           env:
-            # Spring calls the sidecar at loopback
             - name: TRIAGE_BASE_URL
               value: http://127.0.0.1:8000
-            # Threshold (MB) for routing decisions
             - name: MEMSPIKE_THRESHOLD_MB
               value: "3500"
+            - name: MANAGEMENT_SERVER_PORT
+              value: "8033"
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
           readinessProbe:
-            # Marks container 'ready' when actuator responds
-            httpGet: { path: /actuator/health, port: http }
+            httpGet: { path: /actuator/health/readiness, port: http }
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:
-            # Conservative local defaults; tune as needed
             requests: { cpu: "200m", memory: "512Mi" }
-            limits:   { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "500m", memory: "1Gi" }
 
-        # --- FastAPI sidecar (Python) ---
         - name: mem-spike-scorer
           image: localhost:5001/mem-spike-scorer:dev
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
               name: memscore
+          livenessProbe:
+            httpGet: { path: /health, port: memscore }
+            initialDelaySeconds: 10
+            periodSeconds: 10
           readinessProbe:
-            # Simple /healthz endpoint verifies model loaded & process alive
-            httpGet: { path: /healthz, port: memscore }
-            initialDelaySeconds: 3
+            httpGet: { path: /health, port: memscore }
+            initialDelaySeconds: 5
             periodSeconds: 5
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
-            limits:   { cpu: "250m", memory: "256Mi" }
+            limits: { cpu: "250m", memory: "256Mi" }
+
 ---
 apiVersion: v1
 kind: Service

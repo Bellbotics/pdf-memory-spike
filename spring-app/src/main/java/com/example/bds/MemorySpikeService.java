@@ -5,11 +5,13 @@ import com.example.bds.dto.RouteDecision;
 import com.example.bds.ml.PredictionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -20,6 +22,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Stream;
 
 /**
  * Clean demo:
@@ -59,11 +62,22 @@ public class MemorySpikeService {
         this.csvPath = Paths.get(csvPath);
         this.modelPath = Paths.get(modelPath);
 
+        // These are quick FS ops; OK to do here.
         Files.createDirectories(this.dataDir);
         ensureCsvHeader();
 
         this.mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
-        loadModelIfExists();
+        // Defer potentially heavier disk I/O for model loading to a boundedElastic thread.
+        // See @PostConstruct below.
+    }
+
+    @PostConstruct
+    void initAsyncModelLoad() {
+        Mono.fromRunnable(this::loadModelIfExists)
+                .subscribeOn(Schedulers.boundedElastic())
+                .doOnSubscribe(s -> log.info("Initializing local model (async)… path={}", modelPath.toAbsolutePath()))
+                .doOnError(e -> log.warn("Async model init failed: {}", e.toString()))
+                .subscribe();
     }
 
     /* ===================== PREDICTION ===================== */
@@ -74,8 +88,11 @@ public class MemorySpikeService {
         if (!Double.isNaN(local)) {
             return Mono.just(new RouteDecision(makeDecision(local), round1(local)));
         }
-        // fall back to sidecar
+        // No local model → log clearly and use sidecar.
+        log.info("No local model loaded or available at {} — using sidecar for prediction.",
+                modelPath.toAbsolutePath());
         return sidecar.predictViaSidecar(f)
+                .doOnSubscribe(s -> log.debug("Calling sidecar /predict…"))
                 .onErrorResume(err -> {
                     log.warn("Sidecar predict failed; returning conservative default: {}", err.toString());
                     double fallback = -1.0; // “unknown” sentinel
@@ -100,10 +117,9 @@ public class MemorySpikeService {
 
     /** Current sample count (rows with a non-negative label in CSV). */
     public int sampleCount() {
-        try {
-            if (!Files.exists(csvPath)) return 0;
-            // count rows with a valid label (>=0), skipping header
-            long n = Files.lines(csvPath, StandardCharsets.UTF_8)
+        if (!Files.exists(csvPath)) return 0;
+        try (Stream<String> lines = Files.lines(csvPath, StandardCharsets.UTF_8)) {
+            long n = lines
                     .skip(1)
                     .map(String::trim)
                     .filter(s -> !s.isEmpty())
@@ -123,10 +139,13 @@ public class MemorySpikeService {
 
     /** Public training entry: append row with measured label and retrain every N rows. */
     public Mono<Void> train(PdfFeatures f, double measuredPeakMb) {
+        // Offload file writes and CSV scanning to boundedElastic to avoid blocking event-loop threads.
         return Mono.fromRunnable(() -> {
-            appendTrainingRow(f, measuredPeakMb);
-            maybeRetrain();
-        });
+                    appendTrainingRow(f, measuredPeakMb);
+                    maybeRetrain();
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .then();
     }
 
     /* ===================== INTERNAL: local model predict ===================== */
@@ -163,9 +182,10 @@ public class MemorySpikeService {
     }
 
     private synchronized void maybeRetrain() {
-        try {
-            long rows = Files.lines(csvPath).skip(1).count();
+        try (Stream<String> lines = Files.lines(csvPath, StandardCharsets.UTF_8)) {
+            long rows = lines.skip(1).count();
             if (rows > 0 && rows % retrainEvery == 0) {
+                // Train + persist on boundedElastic from caller (train()).
                 Model newModel = trainFromCsv(csvPath);
                 persistModel(newModel);
                 this.model = newModel;
@@ -180,26 +200,28 @@ public class MemorySpikeService {
         List<double[]> X = new ArrayList<>();
         List<Double> y = new ArrayList<>();
 
-        Files.lines(path, StandardCharsets.UTF_8).skip(1).forEach(line -> {
-            String[] cols = line.split(",", -1);
-            if (cols.length < 10) return;
-            try {
-                double[] x = new double[8];
-                x[0] = parse(cols[0]); // size_mb
-                x[1] = parse(cols[1]); // pages
-                x[2] = parse(cols[2]); // image_page_ratio
-                x[3] = parse(cols[3]); // dpi_estimate
-                x[4] = parse(cols[4]); // avg_image_size_kb
-                x[5] = parse(cols[5]); // fonts_embedded_pct
-                x[6] = parse(cols[6]); // xref_error_count
-                x[7] = parse(cols[7]); // ocr_required
-                double label = parse(cols[9]); // label_mb
-                if (label >= 0) {
-                    X.add(x);
-                    y.add(label);
-                }
-            } catch (Exception ignore) { }
-        });
+        try (Stream<String> stream = Files.lines(path, StandardCharsets.UTF_8).skip(1)) {
+            stream.forEach(line -> {
+                String[] cols = line.split(",", -1);
+                if (cols.length < 10) return;
+                try {
+                    double[] x = new double[8];
+                    x[0] = parse(cols[0]); // size_mb
+                    x[1] = parse(cols[1]); // pages
+                    x[2] = parse(cols[2]); // image_page_ratio
+                    x[3] = parse(cols[3]); // dpi_estimate
+                    x[4] = parse(cols[4]); // avg_image_size_kb
+                    x[5] = parse(cols[5]); // fonts_embedded_pct
+                    x[6] = parse(cols[6]); // xref_error_count
+                    x[7] = parse(cols[7]); // ocr_required
+                    double label = parse(cols[9]); // label_mb
+                    if (label >= 0) {
+                        X.add(x);
+                        y.add(label);
+                    }
+                } catch (Exception ignore) { }
+            });
+        }
 
         if (X.isEmpty()) {
             // no usable rows → zero model
@@ -243,10 +265,13 @@ public class MemorySpikeService {
         if (Files.exists(modelPath)) {
             try {
                 this.model = mapper.readValue(Files.readString(modelPath), Model.class);
-                log.info("Loaded model from {}", modelPath);
+                log.info("Loaded local model from {}", modelPath.toAbsolutePath());
             } catch (Exception e) {
                 log.warn("Failed to read model; starting without one: {}", e.toString());
             }
+        } else {
+            log.info("No existing local model at {}. Sidecar will be used until a model is trained or provided.",
+                    modelPath.toAbsolutePath());
         }
     }
 

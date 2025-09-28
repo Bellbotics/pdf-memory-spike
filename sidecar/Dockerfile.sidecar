@@ -1,6 +1,9 @@
 FROM python:3.13-slim
 WORKDIR /app
 
+RUN useradd -ms /bin/bash appuser
+USER appuser
+
 # system libs (scikit-learn wheels should avoid compile; libgomp is safe)
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
 

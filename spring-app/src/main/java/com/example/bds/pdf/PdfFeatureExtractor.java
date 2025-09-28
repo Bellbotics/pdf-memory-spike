@@ -21,6 +21,9 @@ public class PdfFeatureExtractor {
         double sizeMb = (pdfBytes == null ? 0 : pdfBytes.length) / (1024.0 * 1024.0);
 
         try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
+            if (doc.isEncrypted()) throw new IllegalArgumentException("Encrypted PDFs are not supported");
+            if (doc.getNumberOfPages() > 5000) throw new IllegalArgumentException("PDF too large (pages)");
+
             int pages = Math.max(0, doc.getNumberOfPages());
             int imagePages = 0;
             int imagesSeen = 0;
@@ -99,6 +102,8 @@ public class PdfFeatureExtractor {
                     ocrRequired,
                     producer
             );
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Unreadable PDF (corrupt or truncated)");
         }
     }
 
