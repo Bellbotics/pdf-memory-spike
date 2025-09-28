@@ -92,7 +92,7 @@ public class UploadController {
                                         return trainMono.then(memorySpikeService.predictOnly(features))
                                             .map(predAfter -> new UploadResponse(
                                                     predAfter.decision(),
-                                                    predAfter.predicted_peak_mb(),
+                                                    Math.max(0.0, predAfter.predicted_peak_mb()),
                                                     memorySpikeService.threshold(),
                                                     usedLocalBefore,
                                                     samplesBefore,

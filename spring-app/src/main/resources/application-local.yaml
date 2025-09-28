@@ -1,8 +1,19 @@
+server:
+  port: 8033
+
+triage:
+  base-url: http://127.0.0.1:8000
+
 management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,env   # <— add env here, local-only
   datadog:
     metrics:
       export:
         enabled: false
+
 logging:
   level:
-    io.micrometer.datadog: WARN
+    io.netty.resolver.dns: WARN

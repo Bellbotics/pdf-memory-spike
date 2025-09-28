@@ -344,7 +344,7 @@ public class MemorySpikeService {
 
     private static String num(double v) {
         if (Double.isNaN(v) || Double.isInfinite(v)) return "0.0";
-        return String.valueOf(round2(v));
+        return String.format(java.util.Locale.ROOT, "%.4f", v);
     }
 
     private static double parse(String s) {

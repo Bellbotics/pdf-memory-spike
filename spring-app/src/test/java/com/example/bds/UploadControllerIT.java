@@ -19,10 +19,14 @@ import org.springframework.test.web.reactive.server.WebTestClient;
 import java.io.ByteArrayOutputStream;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.containing;
+import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
+import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Full integration test for the /v1/upload/pdf endpoint.
@@ -38,17 +42,13 @@ class UploadControllerIT {
     // Start WireMock on a dynamic port to avoid collisions with other tests.
     private static final WireMockServer wm = new WireMockServer(options().dynamicPort());
 
-    @Autowired WebTestClient web;
+    @Autowired
+    WebTestClient web;
 
-    /**
-     * Register dynamic properties BEFORE the Spring context is created.
-     * We start WireMock here so we can inject its port into the app property.
-     */
+    /** Register dynamic properties BEFORE the Spring context is created. */
     @DynamicPropertySource
     static void registerProps(DynamicPropertyRegistry r) {
-        if (!wm.isRunning()) {
-            wm.start();
-        }
+        if (!wm.isRunning()) wm.start();
         r.add("triage.base-url", () -> "http://127.0.0.1:" + wm.port());
     }
 
@@ -88,6 +88,47 @@ class UploadControllerIT {
 
         wm.verify(postRequestedFor(urlEqualTo("/predict")));
         System.out.println("Serve events:\n" + wm.getAllServeEvents());
+    }
+
+    @Test
+    void upload_postsFeaturesEnvelope_toSidecar() throws Exception {
+        // Clean previous stubs to enforce the stricter contract in this test
+        wm.resetAll();
+
+        // Arrange: sidecar must receive a body with "features.size_mb" etc.
+        wm.stubFor(post(urlEqualTo("/predict"))
+                .withHeader("Content-Type", containing("application/json"))
+                .withRequestBody(matchingJsonPath("$.features.size_mb"))
+                .withRequestBody(matchingJsonPath("$.features.pages"))
+                .withRequestBody(matchingJsonPath("$.features.image_page_ratio"))
+                .willReturn(okJson("""
+                {
+                  "predicted_peak_mb": 1234.5,
+                  "decision": "ROUTE_BIG_MEMORY",
+                  "threshold_mb": 3500.0
+                }
+            """)));
+
+        // Act
+        try (var is = getClass().getResourceAsStream("/samples/text.pdf")) {
+            assertThat(is).isNotNull();
+            var bytes = is.readAllBytes();
+
+            MultipartBodyBuilder mb = new MultipartBodyBuilder();
+            mb.part("file", bytes).filename("text.pdf").contentType(MediaType.APPLICATION_PDF);
+
+            web.post().uri("/v1/upload/pdf")
+                    .contentType(MediaType.MULTIPART_FORM_DATA)
+                    .bodyValue(mb.build())
+                    .exchange()
+                    .expectStatus().is2xxSuccessful()
+                    .expectBody()
+                    .jsonPath("$.predicted_peak_mb").isEqualTo(1234.5);
+        }
+
+        // Assert: WireMock saw the expected shape exactly once
+        wm.verify(1, postRequestedFor(urlEqualTo("/predict"))
+                .withRequestBody(matchingJsonPath("$.features.size_mb")));
     }
 
     private static byte[] tinyPdf() throws Exception {
