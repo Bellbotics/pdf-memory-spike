@@ -1,6 +1,14 @@
 server:
   port: 8033
 
+spring:
+  codec:
+    max-in-memory-size: 50MB   # for WebFlux body aggregation in this demo
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
 triage:
   base-url: http://127.0.0.1:8000
 
