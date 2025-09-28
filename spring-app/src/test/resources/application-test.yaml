@@ -3,7 +3,13 @@ spring:
     banner-mode: "off"
 
 management:
-  metrics:
-    export:
-      datadog:
+  datadog:
+    metrics:
+      export:
         enabled: false
+
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false

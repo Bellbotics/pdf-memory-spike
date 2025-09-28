@@ -96,13 +96,13 @@ public class IntakeController {
         return service.decide(features)
                 .doOnNext(dec -> {
                     long ms = (System.nanoTime() - t0) / 1_000_000;
-                    log.info("memSpike decision",
-                            kv("decision", dec.decision()),
-                            kv("predicted_peak_mb", dec.predicted_peak_mb()),
-                            kv("latency_ms", ms),
-                            kv("pages", features.pages()),
-                            kv("size_mb", features.size_mb()),
-                            kv("producer", features.producer()));
+                    log.info("memSpike decision: decision={}, predicted_peak_mb={}, latency_ms={} pages={}, size_mb={}, producer={}",
+                            dec.decision(),
+                            dec.predicted_peak_mb(),
+                            ms,
+                            features.pages(),
+                            features.size_mb(),
+                            features.producer());
                 });
     }
 
