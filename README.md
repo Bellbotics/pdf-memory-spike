@@ -25,41 +25,41 @@ This project demonstrates a production-style pattern for memory-aware routing:
 
 ```mermaid
 flowchart TD
-  client[Client]
-  upload[POST /v1/upload/pdf]
-  extract[Feature Extractor (PDFBox)]
-  predict{AI/ML Predictor available?}
-  localModel[Local tiny model]
-  sidecar[FastAPI + scikit-learn /predict]
-  decision{Decision}
-  std[STANDARD_PATH]
-  big[ROUTE_BIG_MEMORY]
-  train{Training enabled?}
-  csv[training.csv]
-  model[model.json]
-  mExtract[bds.pdf.extract.duration]
-  mDecision[bds.route.decision]
+  client[Client];
+  upload[POST v1-upload-pdf];
+  extract[Feature Extractor - PDFBox];
+  predict{AI ML Predictor available?};
+  localModel[Local tiny model];
+  sidecar[FastAPI and scikit-learn predict];
+  decision{Decision};
+  std[STANDARD_PATH];
+  big[ROUTE_BIG_MEMORY];
+  train{Training enabled?};
+  csv[training.csv];
+  model[model.json];
+  mExtract[bds.pdf.extract.duration];
+  mDecision[bds.route.decision];
 
-  client -->|multipart/form-data (PDF)| upload
-  upload --> extract
-  extract --> mExtract
-  extract --> predict
+  client -->|"multipart-form-data PDF"| upload;
+  upload --> extract;
+  extract --> mExtract;
+  extract --> predict;
 
-  predict -->|local available| localModel
-  predict -->|else call sidecar| sidecar
+  predict -->|"local available"| localModel;
+  predict -->|"else call sidecar"| sidecar;
 
-  localModel --> decision
-  sidecar --> decision
+  localModel --> decision;
+  sidecar --> decision;
 
-  decision -->|STANDARD_PATH| std
-  decision -->|ROUTE_BIG_MEMORY| big
-  decision --> mDecision
+  decision -->|"STANDARD_PATH"| std;
+  decision -->|"ROUTE_BIG_MEMORY"| big;
+  decision --> mDecision;
 
-  decision --> train
-  train -->|yes| csv
-  train -->|yes| model
-  model -. updates .-> localModel
-  train -->|no| std
+  decision --> train;
+  train -->|"yes"| csv;
+  train -->|"yes"| model;
+  model -.-> localModel;
+  train -->|"no"| std;
 ```
 
 ---
